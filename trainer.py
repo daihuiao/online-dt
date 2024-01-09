@@ -9,6 +9,8 @@ import numpy as np
 import torch
 import time
 
+from tqdm import tqdm
+
 
 class SequenceTrainer:
     def __init__(
@@ -18,7 +20,9 @@ class SequenceTrainer:
         log_temperature_optimizer,
         scheduler=None,
         device="cuda",
+        adjust_temperature=0,
     ):
+        self.adjust_temperature = adjust_temperature
         self.model = model
         self.optimizer = optimizer
         self.log_temperature_optimizer = log_temperature_optimizer
@@ -30,6 +34,7 @@ class SequenceTrainer:
         self,
         loss_fn,
         dataloader,
+        tqdm_bar
     ):
 
         losses, nlls, entropies = [], [], []
@@ -38,6 +43,7 @@ class SequenceTrainer:
 
         self.model.train()
         for _, trajs in enumerate(dataloader):
+            tqdm_bar.update(1)
             loss, nll, entropy = self.train_step_stochastic(loss_fn, trajs)
             losses.append(loss)
             nlls.append(nll)
@@ -95,13 +101,13 @@ class SequenceTrainer:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.25)
         self.optimizer.step()
-
-        self.log_temperature_optimizer.zero_grad()
-        temperature_loss = (
-            self.model.temperature() * (entropy - self.model.target_entropy).detach()
-        )
-        temperature_loss.backward()
-        self.log_temperature_optimizer.step()
+        if self.adjust_temperature==1:
+            self.log_temperature_optimizer.zero_grad()
+            temperature_loss = (
+                self.model.temperature() * (entropy - self.model.target_entropy).detach()
+            )
+            temperature_loss.backward()
+            self.log_temperature_optimizer.step()
 
         if self.scheduler is not None:
             self.scheduler.step()

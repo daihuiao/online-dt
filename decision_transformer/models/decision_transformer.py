@@ -221,6 +221,7 @@ class DecisionTransformer(TrajectoryModel):
             order_embeddings = self.embed_ordering(timesteps)
         else:
             order_embeddings = 0.0
+#todo 这里的位置编码是不是和gpt不一样
 
         state_embeddings = state_embeddings + order_embeddings
         action_embeddings = action_embeddings + order_embeddings

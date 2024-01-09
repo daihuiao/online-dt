@@ -17,9 +17,10 @@ class Logger:
         utils.mkdir(self.log_path)
         print(f"Experiment log path: {self.log_path}")
 
-    def log_metrics(self, outputs, iter_num, total_transitions_sampled, writer):
-        print("=" * 80)
-        print(f"Iteration {iter_num}")
+    def log_metrics(self, outputs, iter_num, total_transitions_sampled, writer,print_output=True):
+        if print_output:
+            print("=" * 80)
+            print(f"Iteration {iter_num}")
         for k, v in outputs.items():
             print(f"{k}: {v}")
             if writer:

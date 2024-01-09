@@ -14,6 +14,7 @@ import gym
 import d4rl
 import torch
 import numpy as np
+from tqdm import tqdm
 
 import utils
 from replay_buffer import ReplayBuffer
@@ -37,7 +38,10 @@ class Experiment:
             variant["env"]
         )
         # initialize by offline trajs
-        self.replay_buffer = ReplayBuffer(variant["replay_size"], self.offline_trajs)
+        if variant["load_replay_buffer"]==1:
+            self.replay_buffer = ReplayBuffer(variant["replay_size"], self.offline_trajs)
+        else:
+            self.replay_buffer = ReplayBuffer(variant["replay_size"])
 
         self.aug_trajs = []
 
@@ -183,11 +187,11 @@ class Experiment:
         return trajectories, state_mean, state_std
 
     def _augment_trajectories(
-        self,
-        online_envs,
-        target_explore,
-        n,
-        randomized=False,
+            self,
+            online_envs,
+            target_explore,
+            n,
+            randomized=False,
     ):
 
         max_ep_len = MAX_EPISODE_LEN
@@ -218,6 +222,9 @@ class Experiment:
         return {
             "aug_traj/return": np.mean(returns),
             "aug_traj/length": np.mean(lengths),
+        },{
+            "aug_traj/returns": returns,
+            "aug_traj/lengths": lengths,
         }
 
     def pretrain(self, eval_envs, loss_fn):
@@ -307,6 +314,7 @@ class Experiment:
             log_temperature_optimizer=self.log_temperature_optimizer,
             scheduler=self.scheduler,
             device=self.device,
+            adjust_temperature=self.variant["adjust_temperature"],
         )
         eval_fns = [
             create_vec_eval_episodes_fn(
@@ -324,15 +332,47 @@ class Experiment:
         writer = (
             SummaryWriter(self.logger.log_path) if self.variant["log_to_tb"] else None
         )
-        while self.online_iter < self.variant["max_online_iters"]:
 
+        # online 数据收集
+        return_observed = []
+        normalized_return_observed = []
+
+        with tqdm() as pbar:
+            pbar.set_description(f"Online Iteration collecting data ")
+            while len(return_observed) < 30:
+                augment_output,augment_outputs = self._augment_trajectories(
+                    online_envs,
+                    self.variant["online_rtg"],
+                    n=self.variant["num_online_rollouts"],
+                )
+                # return_observed = [augment_outputs["aug_traj/return"][i] for i in
+                #                    range(len(augment_outputs["aug_traj/return"]))]
+                for i, return_observed_ in enumerate(augment_outputs["aug_traj/returns"]):
+                    return_observed.append(return_observed_)
+                pbar.update(augment_outputs["aug_traj/returns"].size)
+
+        # 开始收集数据 和 训练
+        ppo_margin = self.variant["ppo_margin"]
+        # ppo_margin = 10.0
+        tqdm_bar = tqdm(total=self.variant["num_updates_per_online_iter"])
+
+        while self.online_iter < self.variant["max_online_iters"]:
+            # for self.online_iter in tqdm(range(self.variant["max_online_iters"])):
             outputs = {}
-            augment_outputs = self._augment_trajectories(
+            augment_output,augment_outputs = self._augment_trajectories(
                 online_envs,
-                self.variant["online_rtg"],
+                max(return_observed) + ppo_margin,
                 n=self.variant["num_online_rollouts"],
-            )
-            outputs.update(augment_outputs)
+                )
+            temp_normalized_return_observed = []
+            for i, return_observed_ in enumerate(augment_outputs["aug_traj/returns"]):
+                return_observed.append(return_observed_)
+                normalized_return_observed_ = self.env.get_normalized_score(return_observed_)
+                normalized_return_observed.append(normalized_return_observed_)
+                temp_normalized_return_observed.append(normalized_return_observed_)
+            outputs.update(augment_output)
+            outputs[f"policy_upgrade/ppo_margin:{ppo_margin}-max_return"] = max(return_observed)
+            outputs[f"policy_upgrade/mean_normalized_return"] = np.mean(temp_normalized_return_observed)
 
             dataloader = create_dataloader(
                 trajectories=self.replay_buffer.trajectories,
@@ -356,9 +396,12 @@ class Experiment:
             else:
                 evaluation = False
 
+            #*********training*********
+            tqdm_bar.set_description(f"Online Iteration {self.online_iter}")
             train_outputs = trainer.train_iteration(
                 loss_fn=loss_fn,
                 dataloader=dataloader,
+                tqdm_bar=tqdm_bar,
             )
             outputs.update(train_outputs)
 
@@ -374,6 +417,7 @@ class Experiment:
                 iter_num=self.pretrain_iter + self.online_iter,
                 total_transitions_sampled=self.total_transitions_sampled,
                 writer=writer,
+                print_output=True,
             )
 
             self._save_model(
@@ -390,10 +434,10 @@ class Experiment:
         import d4rl
 
         def loss_fn(
-            a_hat_dist,
-            a,
-            attention_mask,
-            entropy_reg,
+                a_hat_dist,
+                a,
+                attention_mask,
+                entropy_reg,
         ):
             # a_hat is a SquashedNormal Distribution
             log_likelihood = a_hat_dist.log_likelihood(a)[attention_mask > 0].mean()
@@ -431,6 +475,7 @@ class Experiment:
 
         print("\n\nMaking Eval Env.....")
         env_name = self.variant["env"]
+        self.env = gym.make(env_name)
         if "antmaze" in env_name:
             env = gym.make(env_name)
             target_goal = env.target_goal
@@ -447,6 +492,7 @@ class Experiment:
 
         self.start_time = time.time()
         if self.variant["max_pretrain_iters"]:
+            # if False:
             self.pretrain(eval_envs, loss_fn)
 
         if self.variant["max_online_iters"]:
@@ -463,6 +509,8 @@ class Experiment:
         eval_envs.close()
 
 
+
+haha = True
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=10)
@@ -476,8 +524,6 @@ if __name__ == "__main__":
     parser.add_argument("--activation_function", type=str, default="relu")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--eval_context_length", type=int, default=5)
-    # 0: no pos embedding others: absolute ordering
-    parser.add_argument("--ordering", type=int, default=0)
 
     # shared evaluation options
     parser.add_argument("--eval_rtg", type=int, default=3600)
@@ -491,22 +537,29 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_steps", type=int, default=10000)
 
     # pretraining options
-    parser.add_argument("--max_pretrain_iters", type=int, default=1)
+    parser.add_argument("--max_pretrain_iters", type=int, default=0)
     parser.add_argument("--num_updates_per_pretrain_iter", type=int, default=5000)
 
     # finetuning options
-    parser.add_argument("--max_online_iters", type=int, default=1500)
+    parser.add_argument("--max_online_iters", type=int, default=15000)
     parser.add_argument("--online_rtg", type=int, default=7200)
-    parser.add_argument("--num_online_rollouts", type=int, default=1)
-    parser.add_argument("--replay_size", type=int, default=1000)
+    parser.add_argument("--num_online_rollouts", type=int, default=10)
     parser.add_argument("--num_updates_per_online_iter", type=int, default=300)
     parser.add_argument("--eval_interval", type=int, default=10)
 
     # environment options
-    parser.add_argument("--device", type=str, default="cuda")
+    # 0: no pos embedding others: absolute ordering
+    parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--log_to_tb", "-w", type=bool, default=True)
     parser.add_argument("--save_dir", type=str, default="./exp")
     parser.add_argument("--exp_name", type=str, default="default")
+
+    #my options
+    parser.add_argument("--ordering", type=int, default=0)
+    parser.add_argument("--replay_size", type=int, default=10000)
+    parser.add_argument("--ppo_margin", type=float, default=10.0)
+    parser.add_argument("--load_replay_buffer", type=int, default=0)
+    parser.add_argument("--adjust_temperature", type=int, default=0) #0: False, 1: True
 
     args = parser.parse_args()
 
